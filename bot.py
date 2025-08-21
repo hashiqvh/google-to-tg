@@ -10,6 +10,7 @@ import uvicorn
 from telegram import Update, Chat, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
+# Load .env in current folder (adjust if your .env is elsewhere)
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -145,11 +146,17 @@ def get_access_token(u:dict)->str:
         return t["access_token"]
     raise RuntimeError("No valid Google token; use /connect")
 
-# --- Telegram send helpers ---
-def tg_send(chat_id, method, files=None, **data):
+# --- Telegram send helpers (FIXED API) ---
+def tg_send(method: str, *, chat_id: int | str, files=None, **data):
+    """
+    Send a Telegram API call.
+    Usage: tg_send("sendMessage", chat_id=123, text="hi")
+           tg_send("sendPhoto", chat_id=..., files={"photo": (..., bytes, mime)})
+    """
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
-    r = requests.post(url, data=data, files=files, timeout=300)
-    j = r.json()
+    payload = {"chat_id": chat_id, **data}
+    r = requests.post(url, data=payload, files=files, timeout=300)
+    j = r.json() if r.headers.get("content-type","").startswith("application/json") else {}
     if r.status_code != 200 or not j.get("ok", False):
         raise RuntimeError(f"Telegram error {r.status_code}: {j}")
     return j
@@ -159,13 +166,13 @@ def send_media_auto(dest_chat_id:str, name:str, content:bytes, mime:str|None):
         raise RuntimeError("File exceeds 2GB")
     if (mime or "").startswith("image/") and len(content) <= PHOTO_MAX:
         files = {"photo": (name, content, mime or "image/jpeg")}
-        return tg_send(dest_chat_id, "sendPhoto", files=files, chat_id=dest_chat_id)
+        return tg_send("sendPhoto", chat_id=dest_chat_id, files=files)
     elif (mime or "").startswith("video/"):
         files = {"video": (name, content, mime or "video/mp4")}
-        return tg_send(dest_chat_id, "sendVideo", files=files, chat_id=dest_chat_id)
+        return tg_send("sendVideo", chat_id=dest_chat_id, files=files)
     else:
         files = {"document": (name, content, mime or "application/octet-stream")}
-        return tg_send(dest_chat_id, "sendDocument", files=files, chat_id=dest_chat_id)
+        return tg_send("sendDocument", chat_id=dest_chat_id, files=files)
 
 # --- Picker flow ---
 def create_picker_session(access_token:str)->dict:
@@ -230,7 +237,8 @@ def oauth_cb(request: Request):
 
     save_tokens(tg_id, token, email)
     # notify user in DM
-    tg_send(tg_id, "sendMessage", chat_id=tg_id, text="✅ Google connected (Picker). Use /picker to select photos.")
+    tg_send("sendMessage", chat_id=tg_id,
+            text="✅ Google connected (Picker). Use /picker to select photos.")
     return {"ok": True}
 
 def run_api():
@@ -291,9 +299,10 @@ async def on_channel_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if tg_id:
             save_channel(tg_id, str(post.chat.id), post.chat.title or "")
             try:
-                tg_send(tg_id, "sendMessage", chat_id=tg_id,
+                tg_send("sendMessage", chat_id=tg_id,
                         text=f"✅ Linked channel: {post.chat.title or post.chat.id}")
-            except Exception: pass
+            except Exception:
+                pass
 
 async def picker_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = get_user(update.effective_user.id)
@@ -334,13 +343,13 @@ async def picker_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     send_media_auto(chat_id, name, content, mime)
                     sent += 1
                     if sent % 10 == 0:
-                        tg_send(tg_id, "sendMessage", chat_id=tg_id, text=f"Progress: {sent} sent…")
+                        tg_send("sendMessage", chat_id=tg_id, text=f"Progress: {sent} sent…")
                     time.sleep(0.5)
                 except Exception as ex:
-                    tg_send(tg_id, "sendMessage", chat_id=tg_id, text=f"Skipped one: {ex}")
-            tg_send(tg_id, "sendMessage", chat_id=tg_id, text=f"✅ Done. Sent {sent} item(s).")
+                    tg_send("sendMessage", chat_id=tg_id, text=f"Skipped one: {ex}")
+            tg_send("sendMessage", chat_id=tg_id, text=f"✅ Done. Sent {sent} item(s).")
         except Exception as ex:
-            tg_send(tg_id, "sendMessage", chat_id=tg_id, text=f"❌ Picker job failed: {ex}")
+            tg_send("sendMessage", chat_id=tg_id, text=f"❌ Picker job failed: {ex}")
 
     threading.Thread(target=worker, args=(update.effective_user.id, ch["chat_id"], sess["id"]), daemon=True).start()
 
@@ -356,6 +365,7 @@ def main():
     app.add_handler(CommandHandler("setchannel", setchannel_cmd))
     app.add_handler(CommandHandler("picker", picker_cmd))
     app.add_handler(MessageHandler(filters.FORWARDED & filters.ChatType.PRIVATE, on_forward))
+    # NOTE: This filter works in practice for channel posts on PTB v20.
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, on_channel_post))
     app.run_polling()
 
