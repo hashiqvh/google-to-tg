@@ -161,18 +161,39 @@ def tg_send(method: str, *, chat_id: int | str, files=None, **data):
         raise RuntimeError(f"Telegram error {r.status_code}: {j}")
     return j
 
-def send_media_auto(dest_chat_id:str, name:str, content:bytes, mime:str|None):
+def send_media_auto(dest_chat_id: str, name: str, content: bytes, mime: str | None):
+    # 2 GB hard limit for Bot API
     if len(content) > FILE_MAX:
         raise RuntimeError("File exceeds 2GB")
-    if (mime or "").startswith("image/") and len(content) <= PHOTO_MAX:
-        files = {"photo": (name, content, mime or "image/jpeg")}
-        return tg_send("sendPhoto", chat_id=dest_chat_id, files=files)
-    elif (mime or "").startswith("video/"):
-        files = {"video": (name, content, mime or "video/mp4")}
-        return tg_send("sendVideo", chat_id=dest_chat_id, files=files)
-    else:
-        files = {"document": (name, content, mime or "application/octet-stream")}
-        return tg_send("sendDocument", chat_id=dest_chat_id, files=files)
+
+    m = (mime or "").lower()
+    is_image = m.startswith("image/")
+
+    # Some formats are problematic for sendPhoto; send as document instead
+    if any(ext in m for ext in ("heic", "heif", "tiff", "raw")):
+        is_image = False
+
+    # Try as photo if small enough; otherwise fall back to document
+    if is_image and len(content) <= PHOTO_MAX:
+        files = {"photo": (name, content, m or "image/jpeg")}
+        try:
+            return tg_send("sendPhoto", chat_id=dest_chat_id, files=files)
+        except Exception as e:
+            # Fallback for Telegram photo constraints or processing issues
+            msg = str(e)
+            if any(x in msg for x in (
+                "PHOTO_INVALID_DIMENSIONS",
+                "IMAGE_PROCESS_FAILED",
+                "PHOTO_EXT_INVALID",
+            )):
+                pass  # fall through to document upload
+            else:
+                raise
+
+    # Default/document fallback (preserves originals & bypasses photo limits)
+    files = {"document": (name, content, m or "application/octet-stream")}
+    return tg_send("sendDocument", chat_id=dest_chat_id, files=files)
+
 
 # --- Picker flow ---
 def create_picker_session(access_token:str)->dict:
