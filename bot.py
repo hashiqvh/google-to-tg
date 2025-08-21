@@ -9,9 +9,16 @@ import uvicorn
 
 from telegram import Update, Chat, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+import re
+from io import BytesIO
+from PIL import Image, ImageOps
+import pillow_heif  # registers HEIF/HEIC/AVIF with Pillow
+pillow_heif.register_heif_opener()
 
 # Load .env in current folder (adjust if your .env is elsewhere)
 load_dotenv()
+PHOTO_MAX = 10 * 1024 * 1024   # 10MB
+MAX_SIDE  = 10000               # Telegram photo dimension limit
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
@@ -101,6 +108,63 @@ def pop_link_code(code:str)->Optional[int]:
     conn.close()
     return row[0] if row else None
 
+
+# -conversion helpers-
+def _to_rgb_no_alpha(img: Image.Image) -> Image.Image:
+    # If HEIC has alpha, flatten over white so JPEG is valid
+    if img.mode in ("RGBA", "LA"):
+        bg = Image.new("RGB", img.size, (255, 255, 255))
+        bg.paste(img, mask=img.split()[-1])
+        return bg
+    if img.mode not in ("RGB", "L"):
+        return img.convert("RGB")
+    return img
+
+def heic_to_jpeg_bytes(content: bytes, filename: str) -> tuple[bytes, str, str]:
+    """
+    Decode HEIC/HEIF/AVIF -> JPEG bytes that are Telegram-friendly.
+    - auto-orients via EXIF
+    - clamps longest side to 10,000 px
+    - compresses to <= 10 MB if possible
+    Returns: (jpeg_bytes, new_filename, "image/jpeg")
+    """
+    img = Image.open(BytesIO(content))
+    img = ImageOps.exif_transpose(img)        # respect orientation
+    img = _to_rgb_no_alpha(img)
+
+    # Clamp size to avoid PHOTO_INVALID_DIMENSIONS
+    w, h = img.size
+    if max(w, h) > MAX_SIDE:
+        scale = MAX_SIDE / float(max(w, h))
+        img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+
+    exif = img.info.get("exif")
+    icc  = img.info.get("icc_profile")
+
+    # Try qualities down to keep under 10MB
+    quality = 95
+    out = BytesIO()
+    img.save(out, format="JPEG", quality=quality, optimize=True,
+             exif=exif if exif else None, icc_profile=icc if icc else None)
+    data = out.getvalue()
+
+    while len(data) > PHOTO_MAX and quality > 70:
+        quality -= 5
+        out = BytesIO()
+        img.save(out, format="JPEG", quality=quality, optimize=True,
+                 exif=exif if exif else None, icc_profile=icc if icc else None)
+        data = out.getvalue()
+
+    new_name = re.sub(r"\.(heic|heif|avif)$", ".jpg", filename, flags=re.I)
+    if new_name == filename:
+        new_name = filename + ".jpg"
+    return data, new_name, "image/jpeg"
+
+def is_heic_like(name: str, mime: str | None) -> bool:
+    m = (mime or "").lower()
+    if m in ("image/heic", "image/heif", "image/heif-sequence", "image/avif"):
+        return True
+    return bool(re.search(r"\.(heic|heif|avif)$", name, flags=re.I))
 # --- Google OAuth helpers ---
 def oauth_url(state:str):
     params = {
@@ -162,38 +226,43 @@ def tg_send(method: str, *, chat_id: int | str, files=None, **data):
     return j
 
 def send_media_auto(dest_chat_id: str, name: str, content: bytes, mime: str | None):
-    # 2 GB hard limit for Bot API
+    # 2 GB hard limit
     if len(content) > FILE_MAX:
         raise RuntimeError("File exceeds 2GB")
 
     m = (mime or "").lower()
-    is_image = m.startswith("image/")
+    # Convert HEIC/HEIF/AVIF -> JPEG for inline album-friendly photos
+    if is_heic_like(name, m):
+        try:
+            content, name, m = heic_to_jpeg_bytes(content, name)
+        except Exception as e:
+            # If conversion fails, send original as document
+            files = {"document": (name, content, mime or "application/octet-stream")}
+            return tg_send("sendDocument", chat_id=dest_chat_id, files=files)
 
-    # Some formats are problematic for sendPhoto; send as document instead
-    if any(ext in m for ext in ("heic", "heif", "tiff", "raw")):
-        is_image = False
+    # Identify images after conversion
+    is_image = (m or "").startswith("image/")
 
-    # Try as photo if small enough; otherwise fall back to document
+    # Try photo path (Telegram will inline + allow albums); obey 10 MB
     if is_image and len(content) <= PHOTO_MAX:
         files = {"photo": (name, content, m or "image/jpeg")}
         try:
             return tg_send("sendPhoto", chat_id=dest_chat_id, files=files)
         except Exception as e:
-            # Fallback for Telegram photo constraints or processing issues
+            # Fallback for dimension/processing issues
             msg = str(e)
             if any(x in msg for x in (
                 "PHOTO_INVALID_DIMENSIONS",
                 "IMAGE_PROCESS_FAILED",
                 "PHOTO_EXT_INVALID",
             )):
-                pass  # fall through to document upload
+                pass  # fall through to document
             else:
                 raise
 
-    # Default/document fallback (preserves originals & bypasses photo limits)
+    # Default/document fallback (original bytes; no photo constraints)
     files = {"document": (name, content, m or "application/octet-stream")}
     return tg_send("sendDocument", chat_id=dest_chat_id, files=files)
-
 
 # --- Picker flow ---
 def create_picker_session(access_token:str)->dict:
