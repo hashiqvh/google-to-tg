@@ -303,6 +303,23 @@ async def on_channel_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         text=f"✅ Linked channel: {post.chat.title or post.chat.id}")
             except Exception:
                 pass
+def _parse_poll_seconds(session_status: dict, default: float = 3.0) -> float:
+    """Parse pollingConfig.pollInterval which can be '5s', '500ms', '1m', number, etc."""
+    raw = (session_status.get("pollingConfig", {}) or {}).get("pollInterval", default)
+    try:
+        if isinstance(raw, (int, float)):
+            return max(2.0, float(raw))  # be gentle
+        s = str(raw).strip().lower()
+        if s.endswith("ms"):
+            return max(2.0, float(s[:-2]) / 1000.0)
+        if s.endswith("s"):
+            return max(2.0, float(s[:-1]))
+        if s.endswith("m"):
+            return max(2.0, float(s[:-1]) * 60.0)
+        # plain number as string
+        return max(2.0, float(s))
+    except Exception:
+        return max(2.0, default)
 
 async def picker_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = get_user(update.effective_user.id)
@@ -335,7 +352,7 @@ async def picker_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             while True:
                 st = session_ready(get_access_token(get_user(tg_id)), session_id)
                 if st.get("mediaItemsSet"): break
-                time.sleep(int((st.get("pollingConfig", {}) or {}).get("pollInterval", 3)))
+                time.sleep(_parse_poll_seconds(st))
             sent = 0
             for it in iter_picked(get_access_token(get_user(tg_id)), session_id):
                 try:
