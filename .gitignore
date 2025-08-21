@@ -1,0 +1,7 @@
+.env
+credentials.json
+token*.json
+token_picker*.json
+*.pem
+.venv/
+__pycache__/
